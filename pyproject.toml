@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imgstack"
+version = "0.1.0"
+description = "Align a stack of images, crop to common area, and optionally save a GIF."
+requires-python = ">=3.10"
+dependencies = [
+    "imageio>=2.33.0",
+    "numpy>=1.24.0",
+]
+scripts = { imgstack = "imgstack:main" }
+
+[project.optional-dependencies]
+opencv = ["opencv-python>=4.8.0.76"]
+
+[dependency-groups]
+build = ["pyinstaller>=6.4"]
+
+[tool.setuptools]
+py-modules = ["imgstack"]
+
+[tool.uv]
+managed = true

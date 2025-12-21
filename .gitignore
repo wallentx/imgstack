@@ -1,0 +1,15 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+
+# Virtual env
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Lockfile
+uv.lock
