@@ -304,18 +304,64 @@ def blend_preview(images: List[np.ndarray]) -> np.ndarray:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Align a stack of images, crop to common area, and optionally make a GIF.")
+    parser = argparse.ArgumentParser(
+        description="Align a stack of images, crop to common area, and optionally make a GIF.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument("input", nargs="?", default=".", help="Input directory containing images (default: current directory)")
-    parser.add_argument("--align-mode", choices=["static", "face", "features"], default="static", help="Alignment focus: 'static' masks out faces (default), 'face' focuses on faces, 'features' uses all features.")
-    parser.add_argument("--reference-index", type=int, default=None, help="Index of reference image after sorting (default: middle frame)")
-    parser.add_argument("--output-dir", default="aligned_out", help="Directory to write outputs")
-    parser.add_argument("--gif", action="store_true", help="Also write an animated GIF")
-    parser.add_argument("--gif-name", default="stack.gif", help="Filename of the output GIF (within output-dir)")
-    parser.add_argument("--fps", type=float, default=4.0, help="GIF frames per second (default 4)")
-    parser.add_argument("--save-overlay", action="store_true", help="Save a blended overlay preview for quick alignment check")
-    parser.add_argument("--debug", action="store_true", help="Save debug visuals (matches/masks)")
-    parser.add_argument("--model", choices=["auto", "homography", "affine", "similarity"], default="auto", help="Geometric model to fit. 'similarity' is most stable for handheld shots.")
-    parser.add_argument("--gif-tool", choices=["auto", "imageio", "magick"], default="auto", help="How to write GIFs: Python imageio or ImageMagick (magick/convert)")
+    parser.add_argument(
+        "-a",
+        "--align-mode",
+        choices=["static", "face", "features"],
+        default="static",
+        help=(
+            "Alignment focus.\n"
+            "  static    motion-masked background (default)\n"
+            "  face      prioritize detected faces\n"
+            "  features  use all features (no masking)"
+        ),
+    )
+    parser.add_argument(
+        "-r",
+        "--reference-index",
+        type=int,
+        default=None,
+        help=(
+            "Reference frame index after sorting (0-based).\n"
+            "  0..N-1    default: middle frame"
+        ),
+    )
+    parser.add_argument("-o", "--output-dir", default="aligned_out", help="Directory to write outputs")
+    parser.add_argument("-g", "--gif", action="store_true", help="Also write an animated GIF")
+    parser.add_argument("-n", "--gif-name", default="stack.gif", help="Filename of the output GIF (within output-dir)")
+    parser.add_argument("-f", "--fps", type=float, default=4.0, help="GIF frames per second (default 4)")
+    parser.add_argument("-s", "--save-overlay", action="store_true", help="Save a blended overlay preview for quick alignment check")
+    parser.add_argument("-d", "--debug", action="store_true", help="Save debug visuals (matches/masks)")
+    parser.add_argument(
+        "-m",
+        "--model",
+        choices=["auto", "homography", "affine", "similarity"],
+        default="auto",
+        help=(
+            "Geometric model to fit.\n"
+            "  auto         try homography then affine (default)\n"
+            "  homography   full perspective warp\n"
+            "  affine       rotate/scale/shear\n"
+            "  similarity   rotate/scale only (stable for handheld)"
+        ),
+    )
+    parser.add_argument(
+        "-t",
+        "--gif-tool",
+        choices=["auto", "imageio", "magick"],
+        default="auto",
+        help=(
+            "How to write GIFs.\n"
+            "  auto     prefer imageio, fallback to magick/convert\n"
+            "  imageio  pure Python (no external binary)\n"
+            "  magick   requires ImageMagick's magick/convert in PATH"
+        ),
+    )
 
     args = parser.parse_args()
 
