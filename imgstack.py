@@ -2,12 +2,16 @@
 import argparse
 import os
 import sys
+import tempfile
 from typing import List, Tuple, Optional, Dict, Any
 
 import cv2
 import numpy as np
 import shutil
 import subprocess
+
+from subject_detectors import COCO_CLASSES
+from subject_lock import align_subject_stack
 
 try:
     import imageio.v2 as imageio
@@ -36,20 +40,87 @@ def load_images(paths: List[str]) -> List[np.ndarray]:
     return images
 
 
+def fit_images_to_common_canvas(
+    images: List[np.ndarray], canvas_width: int, canvas_height: int
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Scale images down and center them on a shared canvas.
+
+    The returned masks mark real image pixels. This lets later alignment and
+    intersection cropping discard letterbox padding while keeping every frame
+    exactly the same size.
+    """
+    fitted: List[np.ndarray] = []
+    valid_masks: List[np.ndarray] = []
+
+    for image in images:
+        height, width = image.shape[:2]
+        scale = min(canvas_height / height, canvas_width / width)
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        if new_width == width and new_height == height:
+            resized = image
+        else:
+            resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+        x = (canvas_width - new_width) // 2
+        y = (canvas_height - new_height) // 2
+        canvas = np.zeros((canvas_height, canvas_width, image.shape[2]), dtype=image.dtype)
+        canvas[y:y + new_height, x:x + new_width] = resized
+
+        valid = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+        valid[y:y + new_height, x:x + new_width] = 255
+        fitted.append(canvas)
+        valid_masks.append(valid)
+
+    return fitted, valid_masks
+
+
 def detect_face_mask(image_bgr: np.ndarray) -> np.ndarray:
     # Returns mask (uint8 0/255) where faces are 255
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    cascade_dirs = []
     try:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        cascade_dirs.append(cv2.data.haarcascades)
     except Exception:
-        cascade_path = None
-    if not cascade_path or not os.path.exists(cascade_path):
+        pass
+    prefix = os.environ.get("PREFIX")
+    if prefix:
+        cascade_dirs.append(os.path.join(prefix, "share", "opencv4", "haarcascades"))
+
+    cascade_dir = next((path for path in cascade_dirs if os.path.isdir(path)), None)
+    if cascade_dir is None:
         # No cascade available; return empty mask
         return np.zeros(gray.shape, dtype=np.uint8)
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, flags=cv2.CASCADE_SCALE_IMAGE, minSize=(40, 40))
+
+    frontal = cv2.CascadeClassifier(os.path.join(cascade_dir, "haarcascade_frontalface_default.xml"))
+    profile = cv2.CascadeClassifier(os.path.join(cascade_dir, "haarcascade_profileface.xml"))
+    if frontal.empty() or profile.empty():
+        return np.zeros(gray.shape, dtype=np.uint8)
+
+    # Haar cascades are both faster and more reliable here on a moderate-size
+    # preview. Scale detections back to the working image afterwards.
+    detect_scale = min(1.0, 800.0 / max(gray.shape))
+    if detect_scale < 1.0:
+        detect_gray = cv2.resize(gray, None, fx=detect_scale, fy=detect_scale, interpolation=cv2.INTER_AREA)
+    else:
+        detect_gray = gray
+
+    detect_args = dict(scaleFactor=1.1, minNeighbors=3, flags=cv2.CASCADE_SCALE_IMAGE, minSize=(18, 18))
+    faces = list(frontal.detectMultiScale(detect_gray, **detect_args))
+    faces.extend(profile.detectMultiScale(detect_gray, **detect_args))
+
+    # The profile cascade detects only one orientation, so scan a mirror and
+    # convert those boxes back to the original preview coordinates.
+    flipped = cv2.flip(detect_gray, 1)
+    flipped_faces = profile.detectMultiScale(flipped, **detect_args)
+    detect_width = detect_gray.shape[1]
+    faces.extend((detect_width - x - w, y, w, h) for x, y, w, h in flipped_faces)
+
     mask = np.zeros_like(gray, dtype=np.uint8)
     for (x, y, w, h) in faces:
+        if detect_scale < 1.0:
+            x, y, w, h = (int(round(value / detect_scale)) for value in (x, y, w, h))
         # Slightly dilate the face region to fully cover
         pad_w = int(0.15 * w)
         pad_h = int(0.20 * h)
@@ -295,6 +366,75 @@ def save_gif_auto(frames_bgr: List[np.ndarray], frame_paths: List[str], out_path
         return save_gif_magick(frame_paths, out_path, fps)
 
 
+def save_ffmpeg_animation(
+    frames_bgr: List[np.ndarray], out_path: str, fps: float, output_format: str
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is required for MP4, WebM, and WebP output")
+
+    temp_root = os.environ.get("TMPDIR")
+    with tempfile.TemporaryDirectory(prefix="imgstack-frames-", dir=temp_root) as sequence_dir:
+        for index, frame in enumerate(frames_bgr):
+            frame_path = os.path.join(sequence_dir, f"frame-{index:06d}.png")
+            if not cv2.imwrite(frame_path, frame):
+                raise RuntimeError(f"Failed to prepare animation frame {index}")
+
+        command = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-framerate", str(fps),
+            "-i", os.path.join(sequence_dir, "frame-%06d.png"),
+        ]
+        even_scale = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        if output_format == "mp4":
+            command += [
+                "-vf", even_scale, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+            ]
+        elif output_format == "webm":
+            command += [
+                "-vf", even_scale, "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p",
+                "-crf", "30", "-b:v", "0",
+            ]
+        elif output_format == "webp":
+            command += [
+                "-c:v", "libwebp_anim", "-lossless", "0", "-q:v", "80", "-loop", "0",
+            ]
+        else:
+            raise RuntimeError(f"Unsupported animation format: {output_format}")
+        command.append(out_path)
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as error:
+            message = error.stderr.decode(errors="ignore").strip()
+            raise RuntimeError(f"ffmpeg failed to write {output_format}: {message}") from error
+
+
+def build_crossfade_frames(
+    frames: List[np.ndarray], still_fps: float, crossfade_seconds: float, animation_fps: float
+) -> Tuple[List[np.ndarray], float]:
+    if crossfade_seconds <= 0:
+        return frames, still_fps
+    still_duration = 1.0 / max(still_fps, 1e-6)
+    if crossfade_seconds >= still_duration:
+        raise RuntimeError(
+            f"Crossfade ({crossfade_seconds:.3g}s) must be shorter than frame duration "
+            f"({still_duration:.3g}s at {still_fps:.3g} FPS)"
+        )
+    transition_count = max(1, int(round(crossfade_seconds * animation_fps)))
+    hold_count = max(1, int(round((still_duration - crossfade_seconds) * animation_fps)))
+    rendered: List[np.ndarray] = []
+    for index, current in enumerate(frames):
+        rendered.extend([current] * hold_count)
+        # Wrap the final transition to frame zero so animated outputs loop
+        # without a visible jump.
+        following = frames[(index + 1) % len(frames)]
+        for step in range(1, transition_count + 1):
+            alpha = step / (transition_count + 1)
+            rendered.append(cv2.addWeighted(current, 1.0 - alpha, following, alpha, 0.0))
+    return rendered, animation_fps
+
+
 def blend_preview(images: List[np.ndarray]) -> np.ndarray:
     acc = np.zeros_like(images[0], dtype=np.float32)
     for im in images:
@@ -303,21 +443,76 @@ def blend_preview(images: List[np.ndarray]) -> np.ndarray:
     return np.clip(acc * 255.0, 0, 255).astype(np.uint8)
 
 
+def write_outputs(args: argparse.Namespace, paths: List[str], frames: List[np.ndarray]) -> None:
+    aligned_paths: List[str] = []
+    for index, (source_path, image) in enumerate(zip(paths, frames)):
+        base = os.path.splitext(os.path.basename(source_path))[0]
+        output_path = os.path.join(args.output_dir, f"{index:02d}_{base}_aligned.png")
+        if not cv2.imwrite(output_path, image):
+            raise RuntimeError(f"Failed to write aligned frame: {output_path}")
+        aligned_paths.append(output_path)
+
+    if args.save_overlay:
+        overlay = blend_preview(frames)
+        cv2.imwrite(os.path.join(args.output_dir, "overlay_preview.png"), overlay)
+
+    requested_outputs = []
+    if args.gif:
+        requested_outputs.append(("gif", args.gif_name))
+    if args.mp4:
+        requested_outputs.append(("mp4", args.mp4_name))
+    if args.webm:
+        requested_outputs.append(("webm", args.webm_name))
+    if args.webp:
+        requested_outputs.append(("webp", args.webp_name))
+
+    if args.crossfade > 0 and not requested_outputs:
+        raise RuntimeError("--crossfade applies only when an animated output is requested")
+    animation_frames, output_fps = build_crossfade_frames(
+        frames, args.fps, args.crossfade, args.animation_fps
+    )
+
+    errors = []
+    for output_format, filename in requested_outputs:
+        output_path = os.path.join(args.output_dir, filename)
+        try:
+            if output_format == "gif":
+                if args.crossfade > 0 and args.gif_tool == "magick":
+                    raise RuntimeError("crossfade GIF output requires --gif-tool imageio or auto")
+                if args.crossfade > 0:
+                    save_gif_imageio(animation_frames, output_path, output_fps)
+                else:
+                    save_gif_auto(frames, aligned_paths, output_path, fps=args.fps, tool=args.gif_tool)
+            else:
+                save_ffmpeg_animation(animation_frames, output_path, output_fps, output_format)
+        except Exception as error:
+            errors.append(f"{output_format}: {error}")
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    if args.delete_frames:
+        if not requested_outputs:
+            raise RuntimeError("--delete-frames requires at least one animation output")
+        for frame_path in aligned_paths:
+            os.unlink(frame_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Align a stack of images, crop to common area, and optionally make a GIF.",
+        description="Align or subject-lock an image stack and export animated image/video formats.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("input", nargs="?", default=".", help="Input directory containing images (default: current directory)")
     parser.add_argument(
         "-a",
         "--align-mode",
-        choices=["static", "face", "features"],
+        choices=["static", "face", "subject", "features"],
         default="static",
         help=(
             "Alignment focus.\n"
             "  static    motion-masked background (default)\n"
-            "  face      prioritize detected faces\n"
+            "  face      YuNet multi-face subject lock (legacy alias)\n"
+            "  subject   constant-size detector/tracker subject lock\n"
             "  features  use all features (no masking)"
         ),
     )
@@ -334,7 +529,25 @@ def main():
     parser.add_argument("-o", "--output-dir", default="aligned_out", help="Directory to write outputs")
     parser.add_argument("-g", "--gif", action="store_true", help="Also write an animated GIF")
     parser.add_argument("-n", "--gif-name", default="stack.gif", help="Filename of the output GIF (within output-dir)")
-    parser.add_argument("-f", "--fps", type=float, default=4.0, help="GIF frames per second (default 4)")
+    parser.add_argument("-f", "--fps", type=float, default=2.0, help="Source frames per second (default 2; each still lasts 0.5s)")
+    parser.add_argument("--mp4", action="store_true", help="Also write an H.264 MP4")
+    parser.add_argument("--mp4-name", default="stack.mp4", help="MP4 filename within output-dir")
+    parser.add_argument("--webm", action="store_true", help="Also write a VP9 WebM")
+    parser.add_argument("--webm-name", default="stack.webm", help="WebM filename within output-dir")
+    parser.add_argument("--webp", action="store_true", help="Also write an animated WebP")
+    parser.add_argument("--webp-name", default="stack.webp", help="WebP filename within output-dir")
+    parser.add_argument(
+        "--crossfade", type=float, default=0.0, metavar="SECONDS",
+        help="Crossfade animated outputs, including last-to-first looping (default: disabled)",
+    )
+    parser.add_argument(
+        "--animation-fps", type=float, default=20.0,
+        help="Render FPS used when crossfading (default 20)",
+    )
+    parser.add_argument(
+        "--delete-frames", action="store_true",
+        help="Delete aligned PNG frames after every requested animation succeeds",
+    )
     parser.add_argument("-s", "--save-overlay", action="store_true", help="Save a blended overlay preview for quick alignment check")
     parser.add_argument("-d", "--debug", action="store_true", help="Save debug visuals (matches/masks)")
     parser.add_argument(
@@ -362,8 +575,67 @@ def main():
             "  magick   requires ImageMagick's magick/convert in PATH"
         ),
     )
+    parser.add_argument(
+        "--subject-detector",
+        choices=["yunet", "person", "pose", "nanodet", "yolox"],
+        default="yolox",
+        help=(
+            "Detector for --align-mode subject.\n"
+            "  yunet    faces and five landmarks\n"
+            "  person   MediaPipe person detector\n"
+            "  pose     person detector refined by body landmarks\n"
+            "  nanodet  lightweight COCO object detector\n"
+            "  yolox    stronger COCO object detector (default)"
+        ),
+    )
+    parser.add_argument(
+        "--subject-class", default="person",
+        help="COCO class for NanoDet/YOLOX subject locking (default person)",
+    )
+    parser.add_argument(
+        "--subject-selection",
+        choices=["all", "largest", "leftmost", "rightmost"],
+        default=None,
+        help="Which matching detections to lock (default: largest; face alias: all)",
+    )
+    parser.add_argument(
+        "--subject-count", type=int, default=0,
+        help="Maximum highest-confidence detections for 'all'; 0 keeps all",
+    )
+    parser.add_argument(
+        "--subject-confidence", type=float, default=None,
+        help="Override the selected detector's confidence threshold",
+    )
+    parser.add_argument(
+        "--subject-model", default=None,
+        help="Override model path for YuNet, person, NanoDet, or YOLOX",
+    )
+    parser.add_argument(
+        "--subject-size",
+        choices=["diagonal", "width", "height", "area"],
+        default="diagonal",
+        help="Measurement held constant across frames (default diagonal)",
+    )
+    parser.add_argument(
+        "--subject-tracker", choices=["none", "vittrack"], default="none",
+        help="Optionally track the selected union between ordered frames",
+    )
 
     args = parser.parse_args()
+
+    if args.fps <= 0:
+        parser.error("--fps must be greater than zero")
+    if args.animation_fps <= 0:
+        parser.error("--animation-fps must be greater than zero")
+    if args.crossfade < 0:
+        parser.error("--crossfade cannot be negative")
+    if args.subject_count < 0:
+        parser.error("--subject-count cannot be negative")
+    if args.subject_class not in COCO_CLASSES:
+        parser.error(
+            f"Unknown --subject-class {args.subject_class!r}. "
+            f"Choose one of: {', '.join(COCO_CLASSES)}"
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -373,33 +645,53 @@ def main():
         sys.exit(1)
 
     images = load_images(paths)
+
+    ref_idx = args.reference_index
+    if ref_idx is None:
+        ref_idx = len(images) // 2
+    if not (0 <= ref_idx < len(images)):
+        print("reference-index out of range", file=sys.stderr)
+        sys.exit(1)
+
+    if args.align_mode in ("face", "subject"):
+        detector_name = "yunet" if args.align_mode == "face" else args.subject_detector
+        selection = args.subject_selection or ("all" if args.align_mode == "face" else "largest")
+        subject_count = args.subject_count
+        if args.align_mode == "face" and subject_count == 0:
+            subject_count = 2
+        try:
+            cropped, _groups = align_subject_stack(
+                images=images,
+                names=[os.path.basename(path) for path in paths],
+                reference_index=ref_idx,
+                detector_name=detector_name,
+                selection=selection,
+                count=subject_count,
+                class_name=args.subject_class,
+                confidence=args.subject_confidence,
+                explicit_model=args.subject_model,
+                size_metric=args.subject_size,
+                tracker_name=args.subject_tracker,
+                debug_dir=args.output_dir if args.debug else None,
+            )
+            write_outputs(args, paths, cropped)
+        except RuntimeError as error:
+            print(f"Subject alignment failed: {error}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"Subject-locked {len(paths)} images with {detector_name}. "
+            f"Outputs in: {args.output_dir}"
+        )
+        return
+
     heights = [im.shape[0] for im in images]
     widths = [im.shape[1] for im in images]
 
-    # Resize to the smallest size among images to avoid upscaling during matching
+    # Fit every image to one canvas. Merely scaling by the same bounds is not
+    # enough: portrait and landscape inputs would still have different shapes.
     min_h = min(heights)
     min_w = min(widths)
-    resized = []
-    resize_scales = []
-    for im in images:
-        h, w = im.shape[:2]
-        scale = min(min_h / h, min_w / w)
-        if abs(scale - 1.0) < 1e-6:
-            resized.append(im)
-            resize_scales.append(1.0)
-        else:
-            new_w = int(round(w * scale))
-            new_h = int(round(h * scale))
-            resized.append(cv2.resize(im, (new_w, new_h), interpolation=cv2.INTER_AREA))
-            resize_scales.append(scale)
-
-    # Choose reference
-    ref_idx = args.reference_index
-    if ref_idx is None:
-        ref_idx = len(resized) // 2
-    if not (0 <= ref_idx < len(resized)):
-        print("reference-index out of range", file=sys.stderr)
-        sys.exit(1)
+    resized, source_valid_masks = fit_images_to_common_canvas(images, min_w, min_h)
 
     ref = resized[ref_idx]
 
@@ -408,19 +700,18 @@ def main():
     if args.align_mode == "static":
         # Motion-based static masks
         per_image_masks = compute_static_region_masks(resized)
+        per_image_masks = [
+            cv2.bitwise_and(mask, valid)
+            for mask, valid in zip(per_image_masks, source_valid_masks)
+        ]
         if args.debug:
             for i, m in enumerate(per_image_masks):
                 try:
                     cv2.imwrite(os.path.join(args.output_dir, f"{i:02d}_static_mask.png"), m)
                 except Exception:
                     pass
-    elif args.align_mode == "face":
-        per_image_masks = [detect_face_mask(im) for im in resized]
-        if args.debug:
-            for i, m in enumerate(per_image_masks):
-                cv2.imwrite(os.path.join(args.output_dir, f"{i:02d}_face_mask.png"), m)
     else:  # features
-        per_image_masks = [None for _ in resized]
+        per_image_masks = source_valid_masks
 
     transforms: List[Tuple[str, np.ndarray]] = []
     for idx, img in enumerate(resized):
@@ -457,15 +748,16 @@ def main():
 
     for idx, (ttype, M) in enumerate(transforms):
         img = resized[idx]
+        valid = source_valid_masks[idx]
         if ttype == "homography":
             warped = cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-            mask = cv2.warpPerspective(np.full((img.shape[0], img.shape[1]), 255, dtype=np.uint8), M, (out_w, out_h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+            mask = cv2.warpPerspective(valid, M, (out_w, out_h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
         elif ttype == "affine":
             warped = cv2.warpAffine(img, M, (out_w, out_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-            mask = cv2.warpAffine(np.full((img.shape[0], img.shape[1]), 255, dtype=np.uint8), M, (out_w, out_h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+            mask = cv2.warpAffine(valid, M, (out_w, out_h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
         else:
             warped = img.copy()
-            mask = np.full((out_h, out_w), 255, dtype=np.uint8)
+            mask = valid.copy()
         warped_images.append(warped)
         warped_masks.append(mask)
 
@@ -481,24 +773,11 @@ def main():
     x, y, w, h = bbox
     cropped = [im[y:y+h, x:x+w] for im in warped_images]
 
-    # Write aligned frames
-    aligned_paths: List[str] = []
-    for i, (src_path, im) in enumerate(zip(paths, cropped)):
-        base = os.path.splitext(os.path.basename(src_path))[0]
-        out_path = os.path.join(args.output_dir, f"{i:02d}_{base}_aligned.png")
-        cv2.imwrite(out_path, im)
-        aligned_paths.append(out_path)
-
-    if args.save_overlay:
-        overlay = blend_preview(cropped)
-        cv2.imwrite(os.path.join(args.output_dir, "overlay_preview.png"), overlay)
-
-    if args.gif:
-        gif_path = os.path.join(args.output_dir, args.gif_name)
-        try:
-            save_gif_auto(cropped, aligned_paths, gif_path, fps=args.fps, tool=args.gif_tool)
-        except Exception as e:
-            print(f"Failed to save GIF: {e}", file=sys.stderr)
+    try:
+        write_outputs(args, paths, cropped)
+    except RuntimeError as error:
+        print(f"Output failed: {error}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Aligned {len(paths)} images. Outputs in: {args.output_dir}")
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "imgstack"
 version = "0.1.0"
-description = "Align a stack of images, crop to common area, and optionally save a GIF."
+description = "Align or subject-lock image stacks and export animated images or video."
 requires-python = ">=3.10"
 dependencies = [
     "imageio>=2.33.0",
@@ -17,10 +17,14 @@ scripts = { imgstack = "imgstack:main" }
 opencv = ["opencv-python>=4.8.0.76"]
 
 [dependency-groups]
-build = ["pyinstaller>=6.4"]
+# PyInstaller 6.20 added Python 3.13+ Termux platform detection.
+build = ["pyinstaller>=6.20"]
 
 [tool.setuptools]
-py-modules = ["imgstack"]
+py-modules = ["imgstack", "subject_detectors", "subject_lock"]
+
+[tool.setuptools.data-files]
+"share/imgstack/models" = ["models/*.onnx", "models/NOTICE.md"]
 
 [tool.uv]
 managed = true
